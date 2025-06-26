@@ -1,5 +1,9 @@
-﻿use any_tensor::digit_layout::types;
-use std::iter::zip;
+use any_tensor::digit_layout::types;
+use cuda::{Device, Ptx};
+use std::{
+    ffi::{c_float, c_long, c_uint, c_ulong},
+    iter::zip,
+};
 
 macro_rules! destruct {
     ($pat:pat = $slice:expr) => {
@@ -278,6 +282,116 @@ impl FlashAttentionBlock<'_> {
     }
 }
 
+pub fn flash_attention_cuda(
+    reqs: &mut [Attention],
+    tile_seq: usize, // = tile q  = bn
+    tile_ctx: usize, // = tile kv = bs
+) {
+    // 生成cuda环境
+    assert!(cuda::init().is_ok());
+    let device = Device::new(0);
+    const CODE: &str = include_str!("cuda/attention.cuh");
+    let (ptx, log) = Ptx::compile(CODE, device.compute_capability());
+
+    let Ok(ptx) = ptx else { panic!("{log}") };
+    for req in reqs {
+        let Attention {
+            q,
+            k,
+            v,
+            o,
+            cache,
+            pos,
+        } = req;
+        // 对齐数据类型
+        let dt = distinct(&[q.dt(), k.dt(), v.dt(), o.dt(), cache.dt()]).unwrap();
+        assert_eq!(dt, types::F64);
+        // 解构形状维度
+        destruct!([h_q, n_q, d_q] = q.shape());
+        destruct!([h_o, n_o, d_o] = o.shape());
+        destruct!([kvh_k, n_k, d_k] = k.shape());
+        destruct!([kvh_v, n_v, d_v] = v.shape());
+        destruct!([buf, 2, kvh_c, d_c] = cache.shape());
+        // 对齐张量形状
+        let h = distinct(&[h_q, h_o]).unwrap();
+        let kvh = distinct(&[kvh_k, kvh_v, kvh_c]).unwrap();
+        let n = distinct(&[n_q, n_k, n_v, n_o]).unwrap();
+        let s = *pos + n;
+        let d = distinct(&[d_q, d_k, d_v, d_o, d_c]).unwrap();
+        assert!(buf >= s);
+        // 计算标量参数
+        assert_eq!(h % kvh, 0);
+        let g = h / kvh;
+        let scale = (d as f64).sqrt().recip();
+        // kv 以页为单位分配
+        assert_eq!(s % tile_ctx, 0);
+        let pages = (0..s / tile_ctx)
+            .map(|i| {
+                let t = cache.as_ref().transform(|l| l.index(0, i * tile_ctx));
+                unsafe { t.get().as_ptr().byte_offset(t.offset()).cast_mut().cast() }
+            })
+            .collect::<Box<_>>();
+        destruct!([sbuf, skv, sh, sd] = cache.strides());
+        assert_eq!(sd, dt.nbytes() as isize);
+        let pages = CachePages {
+            pages,
+            strides: [sbuf, skv, sh],
+            bs: tile_ctx,
+        };
+        // 生成 causal mask
+        let mask_data = (0..n * s)
+            .map(|i| i % s <= s - n + i / s)
+            .collect::<Vec<_>>();
+        let mask = Tensor::from_dim_slice(types::Bool, [n, s]).map(|_| erase_ty(&mask_data));
+
+        // 连接 kv cache
+        pages.concat(&k, &v, *pos);
+
+        device.context().apply(|ctx| {
+            let module = ctx.load(&ptx);
+            let kernel = module.get_kernel(c"__attn_f64");
+
+            let q = q.as_ref().map(|s| ctx.from_host(s));
+            let o = o.as_ref().map(|s| ctx.from_host(s));
+            let k = k.as_ref().map(|s| ctx.from_host(s));
+            let v = v.as_ref().map(|s| ctx.from_host(s));
+            let pages = cache.as_ref().map(|s| ctx.from_host(s));
+            let l = any_tensor::Tensor::new(types::F64, [h, s]).map(|len| ctx.malloc::<u8>(len));
+            let m = any_tensor::Tensor::new(types::F64, [h, s]).map(|len| ctx.malloc::<u8>(len));
+
+            let params = cuda::params![
+                pages.get().as_ptr(),
+                q.get().as_ptr(),
+                o.get().as_ptr(),
+                mask.get().as_ptr(),
+                m.get().as_ptr(),
+                l.get().as_ptr(),
+                n as c_long,                        // sequence length
+                d as c_long,                        // head dim
+                (s / tile_ctx) as c_long,           // = s/bs
+                tile_ctx as c_long,                 // context tile
+                d_q as c_ulong,                     //        q stride
+                d_o as c_ulong,                     //        o stride
+                (buf * 2 * kvh_c * d_c) as c_ulong, // sequence stride
+                (kvh_c * d_c) as c_ulong,           //   k to v stride
+                d_c as c_ulong,                     //  kv head stride
+                scale as c_float
+            ];
+            ctx.stream()
+                .launch(
+                    &kernel,
+                    (
+                        (1 as c_uint, h as c_uint), // grid size
+                        tile_ctx as c_uint,         // block size
+                        (3 * tile_ctx * d + tile_ctx * tile_seq) * size_of::<f64>(),
+                    ),
+                    &*params.to_ptrs(),
+                )
+                .synchronize();
+        });
+    }
+}
+
 type Tensor<T> = any_tensor::Tensor<T, 3>;
 
 fn distinct<T: Eq + Copy>(val: &[T]) -> Option<T> {
@@ -331,9 +445,9 @@ mod test {
         const H: usize = 32;
         const KVH: usize = 4;
         const N: usize = 7;
-        const S: usize = 4096;
+        const S: usize = 128;
         const P: usize = S - N;
-        const D: usize = 2048;
+        const D: usize = 128;
 
         let q = Tensor::from_dim_slice(types::F64, [H, N, D]);
         let o = Tensor::from_dim_slice(types::F64, [H, N, D]);
