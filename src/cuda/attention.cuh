@@ -1,4 +1,5 @@
 ﻿#include <math_constants.h>
+#include <cuda/std/cstdint>
 
 template <typename T>
 struct kv_cache {
