@@ -290,10 +290,10 @@ pub fn flash_attention_cuda(
     // 生成cuda环境
     assert!(cuda::init().is_ok());
     let device = Device::new(0);
-    const CODE: &str =r#"
-#include <stdint.h>
-#include <math_constants.h>
 
+    const CODE: &str = r#"
+#include <cuda/std/cstdint>
+#include <math_constants.h>
 
 template <typename T>
 struct kv_cache {
@@ -305,12 +305,12 @@ struct kv_cache {
 template <typename T>
 __device__ kv_cache<T> locate_cache(
     T *const *pages,
-    int  sbuf,      // sequence stride
-    int  skv,       //   k to v stride
-    int  sh,        //  kv head stride
-    unsigned int   const bs, // context tile
-    unsigned int   const head,
-    unsigned int   const pos) {
+    int64_t  sbuf,      // sequence stride
+    int64_t  skv,       //   k to v stride
+    int64_t  sh,        //  kv head stride
+    uint64_t  const bs, // context tile
+    uint64_t  const head,
+    uint64_t  const pos) {
     sh *= head;
     sbuf *= pos % bs;
     uint8_t *page = (uint8_t *)pages[pos / bs];
@@ -325,21 +325,21 @@ __device__ void __attn(
     bool const *mask_,     // n x s
     T *m,                  // s
     T *l,                  // s
-    unsigned int   const n,      // sequence length
-    unsigned int   const d,      // head dim
-    unsigned int   const ts,     // = s/bs
-    unsigned int   const bs,     // context tile
-    int  const sq,      //        q stride
-    int  const so,      //        o stride
-    int  const kv_sbuf, // sequence stride
-    int  const kv_skv,  //   k to v stride
-    int  const kv_sh,   //  kv head stride
+    uint64_t  const n,      // sequence length
+    uint64_t  const d,      // head dim
+    uint64_t  const ts,     // = s/bs
+    uint64_t  const bs,     // context tile
+    int64_t  const sq,      //        q stride
+    int64_t  const so,      //        o stride
+    int64_t  const kv_sbuf, // sequence stride
+    int64_t  const kv_skv,  //   k to v stride
+    int64_t  const kv_sh,   //  kv head stride
     float const scale) {
     // (batch x head) x (bn)
-    unsigned int   const head = blockIdx.x;
-    unsigned int   const bn = blockDim.x;
-    unsigned int   const it = threadIdx.x;
-    unsigned int   const tn = (n + bn - 1) / bn;
+    uint64_t  const head = blockIdx.x;
+    uint64_t  const bn = blockDim.x;
+    uint64_t  const it = threadIdx.x;
+    uint64_t  const tn = (n + bn - 1) / bn;
 
     extern __shared__ T sram[];
     int tile_size = bs * d;
@@ -348,13 +348,13 @@ __device__ void __attn(
     T *vj = &sram[tile_size * 2];
     T *x = &sram[tile_size * 3];
     // kv
-    for (unsigned int   ikvb = 0; ikvb < ts; ++ikvb) {
+    for (uint64_t  ikvb = 0; ikvb < ts; ++ikvb) {
         // 加载kv
         { // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
-            unsigned int   const end = (ikvb + 1) * bs;
-            for (unsigned int   ikv = ikvb * bs + it, i = it; ikv < end; ikv += bn, i += bn) {
+            uint64_t  const end = (ikvb + 1) * bs;
+            for (uint64_t  ikv = ikvb * bs + it, i = it; ikv < end; ikv += bn, i += bn) {
                 kv_cache const cache = locate_cache(kv_pages, kv_sbuf, kv_skv, kv_sh, bs, head, ikv);
-                for (unsigned int   j = 0; j < d; ++j) {
+                for (uint64_t  j = 0; j < d; ++j) {
                     kj[i * d + j] = cache.k[j];
                     vj[i * d + j] =cache.v[j];
                 }
@@ -363,8 +363,8 @@ __device__ void __attn(
         }
         { // 每个线程计算 q 的一行
 
-            for (unsigned int   iqb = 0; iqb < tn; ++iqb) {
-                unsigned int   iq = iqb * bn + it;
+            for (uint64_t  iqb = 0; iqb < tn; ++iqb) {
+                uint64_t  iq = iqb * bn + it;
                 if (iq >= n) {
                     break;
                 }
@@ -373,7 +373,7 @@ __device__ void __attn(
                 T *o = o_ + iq * so;
                 bool const *mask = mask_ + iq * n + ikvb * bs;
                 // load data
-                for (unsigned int   i = 0; i < d; ++i) {
+                for (uint64_t  i = 0; i < d; ++i) {
                     qi[i] = q[i];
                 }
 
@@ -382,13 +382,13 @@ __device__ void __attn(
 
                 // score = q @ k^T / √d
                 T mi = mi_1;
-                for (unsigned int   i = 0; i < bs; ++i) {
+                for (uint64_t  i = 0; i < bs; ++i) {
                     if (!mask[i]) {
                         x[i] = -CUDART_INF_F;
                     } else {
                         T const *k = kj + i * d;
 
-                        for (unsigned int   j = 0; j < d; ++j) {
+                        for (uint64_t  j = 0; j < d; ++j) {
                             x[i] += qi[j] * kj[j];
                         }
                         x[i] *= scale;
@@ -400,7 +400,7 @@ __device__ void __attn(
                 }
                 // P = exp(S - row_m), row_l = rowsum(P)
                 T sum = 0;
-                for (unsigned int   i = 0; i < bs; ++i) {
+                for (uint64_t  i = 0; i < bs; ++i) {
                     x[i] = ::exp(x[i] - mi);
                     sum += x[i];
                 }
@@ -413,7 +413,7 @@ __device__ void __attn(
 
                 T rdi = 1 / di;
                 exp *= rdi;
-                for (unsigned int   i = 0; i < bs; ++i) {
+                for (uint64_t  i = 0; i < bs; ++i) {
                     x[i] *= rdi;
                 }
             }
@@ -421,22 +421,22 @@ __device__ void __attn(
         }
     }
 }
-__global__ void __attn_f64(
+extern "C" __global__ void __attn_f64(
     double *const *kv_pages,
     double const *q_,
     double *o_,
     bool const *mask_,
     double *m,
     double *l,
-    unsigned int   const n,
-    unsigned int   const d,
-    unsigned int   const ts,
-    unsigned int   const bs,
-    int  const sq,
-    int  const so,
-    int  const kv_sbuf,
-    int  const kv_skv,
-    int  const kv_sh,
+    uint64_t  const n,
+    uint64_t  const d,
+    uint64_t  const ts,
+    uint64_t  const bs,
+    int64_t  const sq,
+    int64_t  const so,
+    int64_t  const kv_sbuf,
+    int64_t  const kv_skv,
+    int64_t  const kv_sh,
     float const scale) {
     // 调用模板实现
     __attn<double>(kv_pages, q_, o_, mask_, m, l, n, d, ts, bs, sq, so, kv_sbuf, kv_skv, kv_sh, scale);
@@ -503,12 +503,14 @@ __global__ void __attn_f64(
         device.context().apply(|ctx| {
             let module = ctx.load(&ptx);
             let kernel = module.get_kernel(c"__attn_f64");
-
+            let pages = cache.as_ref().map(|s| ctx.from_host(s));
             let q = q.as_ref().map(|s| ctx.from_host(s));
             let o = o.as_ref().map(|s| ctx.from_host(s));
+            let mask = mask.as_ref().map(|s| ctx.from_host(s));
+
             let k = k.as_ref().map(|s| ctx.from_host(s));
             let v = v.as_ref().map(|s| ctx.from_host(s));
-            let pages = cache.as_ref().map(|s| ctx.from_host(s));
+
             let l = any_tensor::Tensor::new(types::F64, [h, s]).map(|len| ctx.malloc::<u8>(len));
             let m = any_tensor::Tensor::new(types::F64, [h, s]).map(|len| ctx.malloc::<u8>(len));
 
@@ -519,24 +521,34 @@ __global__ void __attn_f64(
                 mask.get().as_ptr(),
                 m.get().as_ptr(),
                 l.get().as_ptr(),
-                n as c_uint,                        // sequence length
-                d as c_uint,                        // head dim
-                (s / tile_ctx) as c_uint,           // = s/bs
-                tile_ctx as c_uint,                 // context tile
-                d_q as c_int,                     //        q stride
-                d_o as c_int,                     //        o stride
-                (buf * 2 * kvh_c * d_c) as c_int, // sequence stride
-                (kvh_c * d_c) as c_int,           //   k to v stride
-                d_c as c_int,                     //  kv head stride
+                n as c_ulong,                      // sequence length
+                d as c_ulong,                      // head dim
+                (s / tile_ctx) as c_ulong,         // = s/bs
+                tile_ctx as c_ulong,               // context tile
+                d_q as c_long,                     //        q stride
+                d_o as c_long,                     //        o stride
+                (buf * 2 * kvh_c * d_c) as c_long, // sequence stride
+                (kvh_c * d_c) as c_long,           //   k to v stride
+                d_c as c_long,                     //  kv head stride
                 scale as c_float
             ];
+            println!(
+                "grid=({}, {}), block={}, shared_mem={} bytes",
+                1,
+                h,
+                tile_ctx,
+                (3 * tile_ctx * d + tile_ctx * tile_seq) * std::mem::size_of::<f64>()
+            );
+            for (i, p) in params.to_ptrs().iter().enumerate() {
+                println!("param[{i}] = {:?}", p);
+            }
             ctx.stream()
                 .launch(
                     &kernel,
                     (
                         (1 as c_uint, h as c_uint), // grid size
                         tile_ctx as c_uint,         // block size
-                        (3 * tile_ctx * d + tile_ctx * tile_seq) *  std::mem::size_of::<f64>(),
+                        (3 * tile_ctx * d + tile_ctx * tile_seq) * std::mem::size_of::<f64>(),
                     ),
                     &*params.to_ptrs(),
                 )
@@ -600,7 +612,7 @@ mod test {
         const N: usize = 7;
         const S: usize = 128;
         const P: usize = S - N;
-        const D: usize = 128;
+        const D: usize = 16;
 
         let q = Tensor::from_dim_slice(types::F64, [H, N, D]);
         let o = Tensor::from_dim_slice(types::F64, [H, N, D]);
